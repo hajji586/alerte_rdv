@@ -1,42 +1,62 @@
 import os
 import requests
 from bs4 import BeautifulSoup
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail
+import smtplib
 
-# --- Récupération des variables d'environnement ---
-RDV_URL = os.environ.get("RDV_URL")
-SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
-EMAIL_FROM = os.environ.get("EMAIL_FROM")
-EMAIL_TO = os.environ.get("EMAIL_TO")
-TEST_EMAIL_ALERT = os.environ.get("TEST_EMAIL_ALERT", "false").lower() == "true"
+# --- Configuration SendGrid ---
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
+EMAIL_FROM = os.getenv("EMAIL_FROM")
+EMAIL_TO = os.getenv("EMAIL_TO")
 
-# --- Vérification de la page de rendez-vous ---
-response = requests.get(RDV_URL)
-soup = BeautifulSoup(response.text, "html.parser")
+def send_email(subject, body):
+    if not SENDGRID_API_KEY or not EMAIL_FROM or not EMAIL_TO:
+        print("⚠️ Configuration email incomplète")
+        return
 
-# Exemple : récupérer le texte exact de la balise qui indique "Aucun rendez-vous disponible"
-message_rdv = soup.select_one("#main > div:nth-child(1) > div > div:nth-child(2) > div:nth-child(2) > div > div:nth-child(2) > div:nth-child(1) > div:nth-child(2) > div > p")
-texte_rdv = message_rdv.get_text(strip=True) if message_rdv else ""
+    import urllib.request
+    import json
 
-# --- Log pour debug ---
-print("Texte RDV :", texte_rdv)
+    data = {
+        "personalizations": [{"to": [{"email": EMAIL_TO}]}],
+        "from": {"email": EMAIL_FROM},
+        "subject": subject,
+        "content": [{"type": "text/plain", "value": body}],
+    }
 
-# --- Si nouveau rendez-vous disponible ou mode test ---
-if "Aucun rendez-vous disponible" not in texte_rdv or TEST_EMAIL_ALERT:
-    print("Rendez-vous disponible ou mode test activé → envoi email")
+    req = urllib.request.Request(
+        "https://api.sendgrid.com/v3/mail/send",
+        data=json.dumps(data).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {SENDGRID_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        method="POST"
+    )
+
     try:
-        message = Mail(
-            from_email=EMAIL_FROM,
-            to_emails=EMAIL_TO,
-            subject='⚠️ Nouvelle disponibilité de RDV',
-            plain_text_content=f'Un nouveau créneau est disponible sur le site : {RDV_URL}'
-        )
-        sg = SendGridAPIClient(SENDGRID_API_KEY)
-        response = sg.send(message)
-        print("Email envoyé ! Status code :", response.status_code)
+        with urllib.request.urlopen(req) as resp:
+            print("✅ Email envoyé ! Status code :", resp.getcode())
     except Exception as e:
-        print("Erreur lors de l'envoi de l'email :", e)
-else:
-    print("Aucun rendez-vous disponible pour l'instant.")
+        print("❌ Erreur lors de l'envoi de l'email :", e)
 
+def check_rdv():
+    url = "https://visas-fr.tlscontact.com/22318807/workflow/appointment-booking?location=tnTUN2fr"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    resp = requests.get(url, headers=headers)
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Récupération du texte RDV
+    texte_rdv = soup.get_text(strip=True)
+    print("Texte RDV (extrait):", texte_rdv[:200])
+
+    if "Aucun rendez-vous disponible" in texte_rdv:
+        print("ℹ️ Aucun rendez-vous dispo → pas d'alerte.")
+    else:
+        print("⚠️ Texte inattendu, envoi d'une alerte pour vérification manuelle")
+        send_email(
+            "⚠️ [ALERTE] Vérification manuelle requise",
+            f"Le texte ne contient PAS 'Aucun rendez-vous disponible'.\n\nExtrait:\n{texte_rdv[:500]}"
+        )
+
+if __name__ == "__main__":
+    check_rdv()
