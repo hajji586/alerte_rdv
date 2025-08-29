@@ -1,62 +1,70 @@
 import os
-import requests
-from bs4 import BeautifulSoup
-import smtplib
+import cloudscraper
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
+from loguru import logger
 
-# --- Configuration SendGrid ---
+# ==============================
+# Config
+# ==============================
+URL = "https://visas-fr.tlscontact.com/22318807/workflow/appointment-booking?location=tnTUN2fr"
+
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
-EMAIL_FROM = os.getenv("EMAIL_FROM")
 EMAIL_TO = os.getenv("EMAIL_TO")
+EMAIL_FROM = os.getenv("EMAIL_FROM")
+TEST_MODE = os.getenv("TEST_MODE", "False").lower() == "true"
 
-def send_email(subject, body):
-    if not SENDGRID_API_KEY or not EMAIL_FROM or not EMAIL_TO:
-        print("⚠️ Configuration email incomplète")
+# ==============================
+# Fonction d’envoi d’email
+# ==============================
+def send_email(subject, content):
+    if not SENDGRID_API_KEY or not EMAIL_TO or not EMAIL_FROM:
+        logger.error("❌ Configuration email manquante. Vérifie tes variables d'environnement.")
         return
 
-    import urllib.request
-    import json
-
-    data = {
-        "personalizations": [{"to": [{"email": EMAIL_TO}]}],
-        "from": {"email": EMAIL_FROM},
-        "subject": subject,
-        "content": [{"type": "text/plain", "value": body}],
-    }
-
-    req = urllib.request.Request(
-        "https://api.sendgrid.com/v3/mail/send",
-        data=json.dumps(data).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {SENDGRID_API_KEY}",
-            "Content-Type": "application/json"
-        },
-        method="POST"
-    )
-
     try:
-        with urllib.request.urlopen(req) as resp:
-            print("✅ Email envoyé ! Status code :", resp.getcode())
-    except Exception as e:
-        print("❌ Erreur lors de l'envoi de l'email :", e)
-
-def check_rdv():
-    url = "https://visas-fr.tlscontact.com/22318807/workflow/appointment-booking?location=tnTUN2fr"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    resp = requests.get(url, headers=headers)
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    # Récupération du texte RDV
-    texte_rdv = soup.get_text(strip=True)
-    print("Texte RDV (extrait):", texte_rdv[:200])
-
-    if "Aucun rendez-vous disponible" in texte_rdv:
-        print("ℹ️ Aucun rendez-vous dispo → pas d'alerte.")
-    else:
-        print("⚠️ Texte inattendu, envoi d'une alerte pour vérification manuelle")
-        send_email(
-            "⚠️ [ALERTE] Vérification manuelle requise",
-            f"Le texte ne contient PAS 'Aucun rendez-vous disponible'.\n\nExtrait:\n{texte_rdv[:500]}"
+        message = Mail(
+            from_email=EMAIL_FROM,
+            to_emails=EMAIL_TO,
+            subject=subject,
+            plain_text_content=content
         )
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        response = sg.send(message)
+        logger.success(f"✅ Email envoyé ! Status code : {response.status_code}")
+    except Exception as e:
+        logger.exception(f"❌ Erreur lors de l'envoi de l'email : {e}")
 
+# ==============================
+# Fonction de scraping
+# ==============================
+def check_rdv():
+    scraper = cloudscraper.create_scraper()
+    try:
+        response = scraper.get(URL, timeout=20)
+        text = response.text.strip()
+        preview = text[:150].replace("\n", " ")
+
+        logger.info(f"📄 Texte RDV (extrait): {preview}")
+
+        if TEST_MODE:
+            logger.warning("⚠️ Mode TEST activé → envoi email forcé")
+            send_email("ALERTE TEST RDV", "Ceci est un test d'alerte.")
+        elif "Aucun rendez-vous disponible" in text:
+            logger.info("ℹ️ Aucun rendez-vous disponible pour le moment.")
+        elif "Enable JavaScript and cookies" in text:
+            logger.warning("⚠️ Challenge Cloudflare détecté → envoi alerte pour vérification")
+            send_email("⚠️ Vérification nécessaire TLSContact", "Le site demande JavaScript/cookies (Cloudflare).")
+        else:
+            logger.success("🎉 Rendez-vous disponible détecté → envoi alerte")
+            send_email("🎉 RDV disponible TLSContact", "Un rendez-vous est disponible, connecte-toi vite !")
+
+    except Exception as e:
+        logger.exception(f"❌ Erreur lors du scraping : {e}")
+
+# ==============================
+# Point d’entrée
+# ==============================
 if __name__ == "__main__":
+    logger.info("🚀 Lancement du script de surveillance TLSContact")
     check_rdv()
