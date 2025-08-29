@@ -1,4 +1,17 @@
+# Gestion des requêtes HTTP et contournement Cloudflare
 cloudscraper==1.2.71
+requests==2.32.3
+
+# Envoi d'emails via SendGrid
 sendgrid==6.11.0
+
+# Gestion des variables d'environnement (utile si tu ajoutes un .env)
+python-dotenv==1.0.1
+
+# Parsing HTML (au cas où tu veux passer à BeautifulSoup plus tard)
+beautifulsoup4==4.12.3
+
+# Logs plus propres (facultatif mais conseillé)
+loguru==0.7.2
 
 
