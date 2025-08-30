@@ -1,56 +1,49 @@
-import cloudscraper
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail
-from loguru import logger
 import os
+import cloudscraper
+import smtplib
+from email.message import EmailMessage
 
-# -----------------------
-# CONFIGURATION
-# -----------------------
-MODE_TEST = True  # Mettre False pour ne pas envoyer d'emails de test
+# Variables d'environnement
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
+EMAIL_FROM = os.getenv("EMAIL_FROM")
+EMAIL_TO = os.getenv("EMAIL_TO")
+
+# URL à surveiller
 URL_RDV = "https://visas-fr.tlscontact.com/22318807/workflow/appointment-booking?location=tnTUN2fr"
-EMAIL_FROM = os.getenv("EMAIL_FROM")  # Ton email expéditeur
-EMAIL_TO = os.getenv("EMAIL_TO")      # Ton email destinataire
-SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")  # Clé SendGrid
-# -----------------------
 
-scraper = cloudscraper.create_scraper()
+def verifier_rdv():
+    scraper = cloudscraper.create_scraper()
+    response = scraper.get(URL_RDV)
+    texte = response.text
+    return texte
 
-def get_texte_rdv():
+def envoyer_email(subject, body):
+    msg = EmailMessage()
+    msg.set_content(body)
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+
     try:
-        response = scraper.get(URL_RDV)
-        response.raise_for_status()
-        return response.text
+        with smtplib.SMTP("smtp.sendgrid.net", 587) as server:
+            server.starttls()
+            server.login("apikey", SENDGRID_API_KEY)
+            server.send_message(msg)
+        print("✅ Email envoyé !")
     except Exception as e:
-        logger.error(f"Erreur lors de la récupération de la page : {e}")
-        return ""
-
-def send_email(subject="Alerte RDV", content="Un nouveau rendez-vous est disponible !"):
-    if not SENDGRID_API_KEY or not EMAIL_FROM or not EMAIL_TO:
-        logger.error("Variables d'environnement pour l'email non définies")
-        return
-    message = Mail(
-        from_email=EMAIL_FROM,
-        to_emails=EMAIL_TO,
-        subject=subject,
-        html_content=content
-    )
-    try:
-        sg = SendGridAPIClient(SENDGRID_API_KEY)
-        response = sg.send(message)
-        logger.success(f"Email envoyé ! Status code : {response.status_code}")
-    except Exception as e:
-        logger.error(f"Erreur lors de l'envoi de l'email : {e}")
+        print(f"❌ Erreur lors de l'envoi de l'email : {e}")
 
 def main():
-    texte_rdv = get_texte_rdv()
-    logger.info(f"Texte RDV (extrait): {texte_rdv[:100]}...")
+    texte = verifier_rdv()
+    print("Texte RDV (extrait):", texte[:100])
 
-    if "Rendez-vous disponible" in texte_rdv or MODE_TEST:
-        logger.info("Rendez-vous disponible ou mode test activé → envoi email")
-        send_email()
+    # Envoi d’un mail uniquement si un rendez-vous est disponible
+    if "Aucun rendez-vous disponible" not in texte:
+        sujet = "⚠️ Rendez-vous disponible trouvé !"
+        corps = f"Texte RDV :\n{texte[:500]}"
+        envoyer_email(sujet, corps)
     else:
-        logger.info("Aucun rendez-vous détecté → pas d'email envoyé")
+        print("⏳ Pas de rendez-vous disponible. Aucune alerte envoyée.")
 
 if __name__ == "__main__":
     main()
