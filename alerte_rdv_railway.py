@@ -1,99 +1,74 @@
-import os
 import cloudscraper
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-import requests
+import os
+import datetime
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 
-# -----------------------------
-# Configuration depuis Railway
-# -----------------------------
+# Variables d'environnement
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
-EMAIL_FROM = os.getenv("EMAIL_FROM")
-EMAIL_TO = os.getenv("EMAIL_TO")
-TEST_MODE = os.getenv("TEST_MODE", "False").lower() == "true"
+MAIL_FROM = os.getenv("MAIL_FROM")
+MAIL_TO = os.getenv("MAIL_TO")
+URL_RDV = os.getenv("URL_RDV")  # URL du site de RDV
 
-# URL TLSContact
-URL = "https://visas-fr.tlscontact.com/22318807/workflow/appointment-booking?location=tnTUN2fr"
+# Fichier de log
+LOG_FILE = "alerte_rdv.log"
+LAST_CF_ALERT_FILE = "last_cf_alert.txt"
 
-# -----------------------------
-# Fonction pour envoyer un mail
-# -----------------------------
-def send_email(subject, body):
-    if not SENDGRID_API_KEY:
-        print("❌ Pas de clé SendGrid configurée, impossible d’envoyer un mail.")
+# Crée un scraper Cloudflare
+scraper = cloudscraper.create_scraper()
+
+def log_message(message):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"[{timestamp}] {message}\n")
+    print(f"[{timestamp}] {message}")
+
+def send_email(subject, content):
+    if not SENDGRID_API_KEY or not MAIL_FROM or not MAIL_TO:
+        log_message("⚠️ Email non envoyé : variables d'environnement manquantes")
+        return
+    try:
+        mail = Mail(from_email=MAIL_FROM, to_emails=MAIL_TO, subject=subject, plain_text_content=content)
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        response = sg.send(mail)
+        log_message(f"✅ Email envoyé ! Status code : {response.status_code}")
+    except Exception as e:
+        log_message(f"❌ Erreur lors de l'envoi de l'email : {e}")
+
+def main():
+    try:
+        response = scraper.get(URL_RDV)
+        texte_rdv = response.text[:200]  # extrait pour le log
+    except Exception as e:
+        log_message(f"❌ Erreur HTTP : {e}")
         return
 
-    print("📧 Envoi de l'email...")
-
-    data = {
-        "personalizations": [{
-            "to": [{"email": EMAIL_TO}],
-            "subject": subject
-        }],
-        "from": {"email": EMAIL_FROM},
-        "content": [{"type": "text/plain", "value": body}]
-    }
-
-    response = requests.post(
-        "https://api.sendgrid.com/v3/mail/send",
-        headers={
-            "Authorization": f"Bearer {SENDGRID_API_KEY}",
-            "Content-Type": "application/json"
-        },
-        json=data
-    )
-
-    if response.status_code == 202:
-        print("✅ Email envoyé avec succès !")
-    else:
-        print(f"❌ Erreur lors de l’envoi : {response.status_code} → {response.text}")
-
-# -----------------------------
-# Vérification RDV
-# -----------------------------
-def check_rdv():
-    scraper = cloudscraper.create_scraper(
-        browser={
-            'browser': 'firefox',
-            'platform': 'windows',
-            'mobile': False
-        }
-    )
-
-    try:
-        response = scraper.get(URL, timeout=20)
-        texte = response.text.strip()
-
-        # Log partiel pour éviter le spam énorme
-        print("Texte RDV (extrait):", texte[:200])
-
-        # Mode test forcé
-        if TEST_MODE:
-            send_email("✅ TEST MODE : Alerte RDV", "Ceci est un email de test.")
-            return
-
-        # Vérification du contenu
-        if "Aucun rendez-vous disponible" in texte:
-            print("ℹ️ Aucun RDV disponible")
-        elif "Just a moment" in texte or "Enable JavaScript" in texte:
-            print("⚠️ Bloqué par Cloudflare → alerte envoyée")
-            send_email("⚠️ Vérification manuelle requise",
-                       "TLSContact a renvoyé une page de sécurité. Vérifie manuellement : " + URL)
+    if "Just a moment..." in response.text or response.status_code == 503:
+        # Détection Cloudflare
+        last_alert = ""
+        if os.path.exists(LAST_CF_ALERT_FILE):
+            with open(LAST_CF_ALERT_FILE, "r", encoding="utf-8") as f:
+                last_alert = f.read().strip()
+        if last_alert != "cf":
+            log_message(f"⚠️ Bloqué par Cloudflare → alerte envoyée")
+            send_email("⚠️ Alerte Cloudflare", f"Page RDV bloquée par Cloudflare : {URL_RDV}")
+            with open(LAST_CF_ALERT_FILE, "w", encoding="utf-8") as f:
+                f.write("cf")
         else:
-            print("✅ RDV disponible ou texte inattendu → alerte envoyée")
-            send_email("✅ RDV trouvé !",
-                       "Un rendez-vous est peut-être disponible. Vérifie : " + URL)
+            log_message("⚠️ Bloqué par Cloudflare → déjà alerté, pas d'envoi")
+        return
 
-    except Exception as e:
-        print("❌ Erreur lors de la récupération :", str(e))
-        send_email("❌ Erreur script RDV",
-                   f"Le script a rencontré une erreur : {str(e)}")
+    # Réinitialiser le fichier Cloudflare si page OK
+    if os.path.exists(LAST_CF_ALERT_FILE):
+        os.remove(LAST_CF_ALERT_FILE)
 
-# -----------------------------
-# Exécution
-# -----------------------------
+    # Détection d'un vrai créneau
+    if "Rendez-vous disponible" in response.text:
+        log_message("Rendez-vous disponible → envoi email")
+        send_email("Rendez-vous disponible", f"Un créneau est disponible : {URL_RDV}")
+    else:
+        log_message("Pas de créneau disponible, aucun email envoyé")
+
 if __name__ == "__main__":
-    check_rdv()
+    main()
 
-# Redeploy test - 2025-08-30
