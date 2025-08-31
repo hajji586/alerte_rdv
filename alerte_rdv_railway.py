@@ -95,3 +95,5 @@ def check_rdv():
 # -----------------------------
 if __name__ == "__main__":
     check_rdv()
+
+# Redeploy test - 2025-08-30
