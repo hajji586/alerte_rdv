@@ -1,123 +1,120 @@
 import os
-import datetime
-import cloudscraper
+import re
 import smtplib
+import ssl
 from email.mime.text import MIMEText
-import requests
+from email.mime.multipart import MIMEMultipart
+import cloudscraper
+from datetime import datetime
 
-# ========= CONFIG =========
-URL = os.getenv("RDV_URL")  # variable d'environnement sur Railway
-EMAIL_SENDER = os.getenv("EMAIL_SENDER")
-EMAIL_TO = os.getenv("EMAIL_TO")
-SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
+# ========================
+#  Fonction de logging
+# ========================
+def log(message: str):
+    timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+    ligne = f"{timestamp} {message}"
+    print(ligne)
+    with open("alerte_rdv.log", "a", encoding="utf-8") as f:
+        f.write(ligne + "\n")
 
-# fichier log local
-LOG_FILE = "alerte_rdv.log"
-STATE_FILE = "alerte_state.txt"
-
-
-# ========= UTILS =========
-def log_event(message: str):
-    """Écrit un message horodaté dans le log"""
-    timestamp = datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
-    line = f"{timestamp} {message}"
-    print(line)
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
-
-
-def lire_state():
-    if not os.path.exists(STATE_FILE):
-        return set()
-    with open(STATE_FILE, "r", encoding="utf-8") as f:
-        return set(l.strip() for l in f.readlines())
-
-
-def ecrire_state(state_set):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        for item in state_set:
-            f.write(item + "\n")
-
-
-def deja_alerté(tag: str) -> bool:
-    state = lire_state()
-    return tag in state
-
-
-def marquer_comme_alerté(tag: str):
-    state = lire_state()
-    state.add(tag)
-    ecrire_state(state)
-
-
-def envoyer_mail(sujet, contenu):
-    """Envoie un mail via SendGrid"""
-    if not SENDGRID_API_KEY:
-        log_event("❌ Pas de clé SendGrid configurée")
-        return
-
-    data = {
-        "personalizations": [{"to": [{"email": EMAIL_TO}]}],
-        "from": {"email": EMAIL_SENDER},
-        "subject": sujet,
-        "content": [{"type": "text/plain", "value": contenu}],
-    }
-
-    response = requests.post(
-        "https://api.sendgrid.com/v3/mail/send",
-        headers={"Authorization": f"Bearer {SENDGRID_API_KEY}",
-                 "Content-Type": "application/json"},
-        json=data
-    )
-
-    if response.status_code == 202:
-        log_event("✅ Email envoyé avec succès !")
-    else:
-        log_event(f"❌ Erreur lors de l'envoi de l'email : {response.status_code} {response.text}")
-
-
-# ========= SCRAPER =========
-def extraire_texte(url):
-    scraper = cloudscraper.create_scraper()
+# ========================
+#  Récupération de la page
+# ========================
+def recuperer_page(url: str) -> str:
     try:
-        r = scraper.get(url, timeout=30)
-        r.raise_for_status()
-        return r.text[:500]  # extrait seulement le début
+        scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+        }
+        response = scraper.get(url, headers=headers, timeout=20)
+        response.raise_for_status()
+        return response.text
     except Exception as e:
-        log_event(f"❌ Erreur HTTP : {e}")
+        log(f"❌ Erreur HTTP : {e}")
         return ""
 
+# ========================
+#  Analyse du contenu HTML
+# ========================
+def analyser_page(html: str) -> str:
+    # 1. Vérifier si un créneau au format HH:MM apparaît
+    if re.search(r"\b\d{2}:\d{2}\b", html):
+        return "RDV_DISPONIBLE"
 
-# ========= MAIN =========
+    # 2. Cas Cloudflare / blocage JS
+    if "Just a moment..." in html or "Enable JavaScript" in html:
+        return "CLOUDFLARE"
+
+    # 3. Cas standard "Pas de rendez-vous"
+    if "Pas de rendez-vous disponible" in html:
+        return "INDISPONIBLE"
+
+    # 4. Sinon texte inattendu
+    return "INCONNU"
+
+# ========================
+#  Envoi d'email
+# ========================
+def envoyer_mail(sujet: str, corps: str):
+    try:
+        smtp_host = os.getenv("SMTP_HOST")
+        smtp_port = int(os.getenv("SMTP_PORT", "587"))
+        smtp_user = os.getenv("SMTP_USER")
+        smtp_pass = os.getenv("SMTP_PASS")
+        destinataire = os.getenv("DESTINATAIRE")
+
+        if not smtp_host or not smtp_user or not smtp_pass or not destinataire:
+            log("❌ Erreur : variables SMTP manquantes dans Railway")
+            return
+
+        msg = MIMEMultipart()
+        msg["From"] = smtp_user
+        msg["To"] = destinataire
+        msg["Subject"] = sujet
+        msg.attach(MIMEText(corps, "plain", "utf-8"))
+
+        context = ssl.create_default_context()
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls(context=context)
+            server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+
+        log("✅ Email envoyé avec succès !")
+
+    except Exception as e:
+        log(f"❌ Erreur lors de l'envoi de l'email : {e}")
+
+# ========================
+#  Programme principal
+# ========================
 def main():
-    if not URL:
-        log_event("❌ Erreur : RDV_URL n'est pas défini dans les variables Railway")
+    url = os.getenv("RDV_URL")
+    if not url:
+        log("❌ Erreur : RDV_URL n'est pas défini dans les variables Railway")
         return
 
-    texte = extraire_texte(URL)
+    log("🔍 Vérification des rendez-vous...")
+    html = recuperer_page(url)
+    if not html:
+        return
 
-    if "rendez-vous" in texte.lower():
-        log_event("✅ Rendez-vous trouvé → envoi d'alerte")
-        envoyer_mail("Rendez-vous disponible !", texte)
-        marquer_comme_alerté("rdv")
+    etat = analyser_page(html)
 
-    elif "just a moment" in texte.lower() or "enable javascript" in texte.lower():
-        if not deja_alerté("cloudflare"):
-            log_event("⚠️ Bloqué par Cloudflare → alerte envoyée")
-            envoyer_mail("Bloqué par Cloudflare", texte)
-            marquer_comme_alerté("cloudflare")
-        else:
-            log_event("⚠️ Bloqué par Cloudflare → déjà alerté, pas d'envoi")
-
+    if etat == "RDV_DISPONIBLE":
+        log("🚨 RDV disponible trouvé → envoi immédiat d'alerte")
+        envoyer_mail("🚨 RDV DISPONIBLE !", "Un créneau est visible sur le site TLSContact.")
+    elif etat == "CLOUDFLARE":
+        log("⚠️ Bloqué par Cloudflare → pas d'envoi")
+    elif etat == "INDISPONIBLE":
+        log("❌ Aucun rendez-vous disponible")
     else:
-        # Cas inattendu (site down, maintenance, etc.)
-        if not deja_alerté("inattendu"):
-            log_event("⚠️ Texte inattendu → alerte envoyée")
-            envoyer_mail("Texte inattendu sur le site", texte)
-            marquer_comme_alerté("inattendu")
-        else:
-            log_event("⚠️ Texte inattendu → déjà alerté, pas d'envoi")
-
+        log("⚠️ Texte inattendu → pas d'envoi (déjà alerté si nécessaire)")
 
 if __name__ == "__main__":
     main()
