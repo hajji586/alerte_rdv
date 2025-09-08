@@ -1,99 +1,104 @@
 import os
 import cloudscraper
-import datetime
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 import logging
+from datetime import datetime
+import requests
 
-# --- Configuration du logging ---
+# ---------------------
+# Configuration logging
+# ---------------------
+LOG_FILE = "alerte.log"
 logging.basicConfig(
-    filename="alerte_rdv.log",
+    filename=LOG_FILE,
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="[%(asctime)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
 )
 
-# --- Variables d'environnement ---
+# ---------------------
+# Variables d'environnement
+# ---------------------
 RDV_URL = os.getenv("RDV_URL")
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
-MAIL_TO = os.getenv("MAIL_TO")
-MAIL_FROM = os.getenv("MAIL_FROM")
+ALERT_EMAIL = os.getenv("ALERT_EMAIL")
 
-if not RDV_URL:
-    print("❌ Erreur : RDV_URL n'est pas défini dans les variables Railway")
+if not RDV_URL or not SENDGRID_API_KEY or not ALERT_EMAIL:
+    logging.error("❌ Variables d'environnement manquantes (RDV_URL, SENDGRID_API_KEY, ALERT_EMAIL)")
     exit(1)
 
-# --- Headers simulant un vrai navigateur ---
-HEADERS = {
+# ---------------------
+# Config cookies + User-Agent
+# ---------------------
+headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/127.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": "https://web.visas-fr.tlscontact.com/",
-    "Connection": "keep-alive",
+                  "Chrome/128.0.0.0 Safari/537.36"
 }
 
-# --- Option cookies (si besoin, à remplir après export navigateur) ---
-COOKIES = {
-    # "cookie_name": "cookie_value"
+# Si besoin, tu peux ajouter tes cookies ici :
+cookies = {
+    # "cookie_name": "cookie_value",
 }
 
-# --- Cloudsraper pour contourner Cloudflare ---
-scraper = cloudscraper.create_scraper(browser={"custom": "chrome"}, delay=10)
+scraper = cloudscraper.create_scraper(
+    browser={
+        'browser': 'chrome',
+        'platform': 'windows',
+        'mobile': False
+    }
+)
 
+# ---------------------
+# Fonction envoi d’email
+# ---------------------
+def envoyer_mail(sujet, contenu):
+    url = "https://api.sendgrid.com/v3/mail/send"
+    data = {
+        "personalizations": [{
+            "to": [{"email": ALERT_EMAIL}],
+            "subject": sujet
+        }],
+        "from": {"email": ALERT_EMAIL},
+        "content": [{"type": "text/plain", "value": contenu}]
+    }
+    response = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {SENDGRID_API_KEY}",
+                 "Content-Type": "application/json"},
+        json=data
+    )
+    if response.status_code == 202:
+        logging.info(f"📧 Email envoyé : {sujet}")
+    else:
+        logging.error(f"❌ Erreur envoi email : {response.status_code} {response.text}")
 
-def envoyer_mail(sujet, message):
-    """Envoi d'un mail via SendGrid API"""
-    try:
-        import requests
-
-        resp = requests.post(
-            "https://api.sendgrid.com/v3/mail/send",
-            headers={
-                "Authorization": f"Bearer {SENDGRID_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "personalizations": [{"to": [{"email": MAIL_TO}]}],
-                "from": {"email": MAIL_FROM},
-                "subject": sujet,
-                "content": [{"type": "text/plain", "value": message}],
-            },
-        )
-
-        if resp.status_code == 202:
-            print("✅ Email envoyé avec succès !")
-            logging.info("Email envoyé : %s", sujet)
-        else:
-            print(f"❌ Erreur lors de l'envoi : {resp.status_code} {resp.text}")
-            logging.error("Erreur envoi email : %s %s", resp.status_code, resp.text)
-    except Exception as e:
-        print(f"❌ Exception envoi email : {e}")
-        logging.exception("Exception envoi email")
-
-
+# ---------------------
+# Vérification RDV
+# ---------------------
 def verifier_rdv():
-    print("[🔍] Vérification des rendez-vous...")
+    logging.info("[🔍] Vérification des rendez-vous...")
+
     try:
-        response = scraper.get(RDV_URL, headers=HEADERS, cookies=COOKIES, timeout=30)
+        response = scraper.get(RDV_URL, headers=headers, cookies=cookies, timeout=30)
         response.raise_for_status()
-        texte = response.text[:500]
+        texte = response.text[:500]  # extrait pour debug
 
-        print(f"[...] Extrait reçu : {texte[:120]}")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"❌ Erreur HTTP : {e}")
+        return
 
-        if "Notre site web est temporairement indisponible" in texte:
-            envoyer_mail("⚠️ TLSContact indisponible", "Le site affiche une erreur.")
-        elif "Aucun rendez-vous disponible" in texte:
-            print("⏳ Aucun rendez-vous disponible")
-        elif "Rendez-vous disponible" in texte:
-            envoyer_mail("✅ Rendez-vous trouvé", "Un créneau est disponible !")
-        else:
-            envoyer_mail("⚠️ Texte inattendu", "Contenu différent détecté, vérifie manuellement.")
-    except Exception as e:
-        print(f"❌ Erreur HTTP : {e}")
-        logging.exception("Erreur HTTP")
+    # Vérifier contenu
+    if "Aucun rendez-vous disponible" in texte:
+        logging.info("⏳ Aucun rendez-vous disponible.")
+    elif "momentanément indisponible" in texte or "temporarily unavailable" in texte:
+        logging.warning("⚠️ Site temporairement indisponible → envoi alerte")
+        envoyer_mail("⚠️ TLSContact indisponible", texte[:200])
+    else:
+        logging.warning("✅ Rendez-vous possiblement dispo → envoi alerte")
+        envoyer_mail("✅ Rendez-vous disponible !", texte[:500])
 
-
+# ---------------------
+# Exécution principale
+# ---------------------
 if __name__ == "__main__":
     verifier_rdv()
